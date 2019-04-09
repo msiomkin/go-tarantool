@@ -2,10 +2,11 @@ package multi
 
 import (
 	"errors"
-	"github.com/tarantool/go-tarantool"
+	".."
 	"sync"
 	"sync/atomic"
 	"time"
+	"fmt"
 )
 
 const (
@@ -16,13 +17,15 @@ const (
 var (
 	ErrEmptyAddrs = errors.New("addrs should not be empty")
 	ErrWrongCheckTimeout = errors.New("wrong check timeout, must be greater than 0")
+	ErrWrongRefreshNodesTimeout = errors.New("wrong refreshh nodes timeout, must be greater than 30 seconds")
 	ErrNoConnection = errors.New("no active connections")
 )
 
 type ConnectionMulti struct {
-	addrs    []string
-	connOpts tarantool.Opts
-	opts     OptsMulti
+	addrs           []string
+	connOpts        tarantool.Opts
+	opts            OptsMulti
+	refreshNodesErr error
 
 	mutex    sync.RWMutex
 	notify   chan tarantool.ConnEvent
@@ -35,7 +38,13 @@ type ConnectionMulti struct {
 var _ = tarantool.Connector(&ConnectionMulti{}) // check compatibility with connector interface
 
 type OptsMulti struct {
-	CheckTimeout time.Duration
+	CheckTimeout        time.Duration
+	RefreshNodesTimeout time.Duration
+	GetNodesFuncName    string
+}
+
+func (connMulti *ConnectionMulti) GetLastRefreshNodesErr() error {
+	return connMulti.refreshNodesErr
 }
 
 func ConnectWithOpts(addrs []string, connOpts tarantool.Opts, opts OptsMulti) (connMulti *ConnectionMulti, err error) {
@@ -44,6 +53,9 @@ func ConnectWithOpts(addrs []string, connOpts tarantool.Opts, opts OptsMulti) (c
 	}
 	if opts.CheckTimeout <= 0 {
 		return nil, ErrWrongCheckTimeout
+	}
+	if opts.GetNodesFuncName != "" && opts.CheckTimeout <= 30 * time.Second {
+		return nil, ErrWrongRefreshNodesTimeout
 	}
 
 	notify := make(chan tarantool.ConnEvent, 10 * len(addrs)) // x10 to accept disconnected and closed event (with a margin)
@@ -54,13 +66,27 @@ func ConnectWithOpts(addrs []string, connOpts tarantool.Opts, opts OptsMulti) (c
 		opts:     	opts,
 		notify:   	notify,
 		control:  	make(chan struct{}),
-		pool:		make(map[string]*tarantool.Connection),
 	}
 	somebodyAlive, _ := connMulti.warmUp()
 	if !somebodyAlive {
 		connMulti.Close()
 		return nil, ErrNoConnection
 	}
+
+	if connMulti.opts.GetNodesFuncName != "" {
+		if connMulti.refreshNodesErr == nil {
+			newPool, somebodyAlive, _ := connMulti.reheat(addrs)
+			if !somebodyAlive {
+				connMulti.Close()
+				return nil, ErrNoConnection
+			}
+
+			connMulti.setPool(newPool, addrs)
+		}
+
+		go connMulti.nodesRefresher()
+	}
+
 	go connMulti.checker()
 
 	return connMulti, nil
@@ -69,6 +95,7 @@ func ConnectWithOpts(addrs []string, connOpts tarantool.Opts, opts OptsMulti) (c
 func Connect(addrs []string, connOpts tarantool.Opts) (connMulti *ConnectionMulti, err error) {
 	opts := OptsMulti{
 		CheckTimeout: 1 * time.Second,
+		RefreshNodesTimeout: 5 * time.Minute,
 	}
 	return ConnectWithOpts(addrs, connOpts, opts)
 }
@@ -86,10 +113,107 @@ func (connMulti *ConnectionMulti) warmUp() (somebodyAlive bool, errs []error) {
 			connMulti.pool[addr] = conn
 			if conn.ConnectedNow() {
 				somebodyAlive = true
+				if connMulti.opts.GetNodesFuncName != "" {
+					var addrs []string
+					addrs, connMulti.refreshNodesErr = getNodes(conn, connMulti.opts.GetNodesFuncName)
+					if addrs != nil {
+						connMulti.addrs = addrs
+						return
+					}
+				}
 			}
 		}
 	}
 	return
+}
+
+func (connMulti *ConnectionMulti) reheat(addrs []string) (pool map[string]*tarantool.Connection, somebodyAlive bool, errs []error) {
+	connMulti.mutex.RLock()
+	defer connMulti.mutex.RUnlock()
+
+	pool = make(map[string]*tarantool.Connection)
+	errs = make([]error, len(connMulti.addrs))
+
+	for i, addr := range addrs {
+		if connMulti.pool != nil {
+			conn := connMulti.pool[addr]
+			if conn != nil {
+				pool[addr] = conn
+				continue
+			}
+		}
+
+		conn, err := tarantool.Connect(addr, connMulti.connOpts)
+		errs[i] = err
+		if conn != nil && err == nil {
+			if connMulti.fallback == nil {
+				connMulti.fallback = conn
+			}
+			pool[addr] = conn
+			if conn.ConnectedNow() {
+				somebodyAlive = true
+			}
+		}
+	}
+	return
+}
+
+func getNodes(conn *tarantool.Connection, functionName string) (addrs []string, err error) {
+	resp, err := conn.Call(functionName, []interface{}{})
+	if err != nil {
+		return nil, err
+	}
+
+	res := resp.Data[0]
+	list, ok := res.([]interface{})
+	if !ok {
+		err = errors.New(fmt.Sprintf("Invalid nodes list type. Expected: []string, got: %T", res))
+		return nil, err
+	}
+
+	addrs = make([]string, 0)
+	for _, obj := range list {
+		addr, ok := obj.(string)
+		if ok {
+			addrs = append(addrs, addr)
+		}
+	}
+
+	if len(addrs) == 0 {
+		err = errors.New("Empty nodes array")
+		return nil, err
+	}
+
+	return addrs, nil
+}
+
+func (connMulti *ConnectionMulti) setPool(pool map[string]*tarantool.Connection, addrs []string) (oldPool map[string]*tarantool.Connection) {
+	connMulti.mutex.Lock()
+	defer connMulti.mutex.Unlock()
+
+	connMulti.getCurrentConnection().WaitBusy()
+	oldPool = connMulti.pool
+	connMulti.pool = pool
+	connMulti.addrs = addrs
+	connMulti.refreshNodesErr = nil
+
+	return
+}
+
+func (connMulti *ConnectionMulti) ClearOldPool(oldPool map[string]*tarantool.Connection) {
+	if oldPool == nil {
+		return
+	}
+
+	connMulti.mutex.RLock()
+	defer connMulti.mutex.RUnlock()
+
+	for addr, conn := range oldPool {
+		if _, ok := connMulti.pool[addr]; !ok {
+			conn.WaitBusy()
+			conn.Close()
+		}
+	}
 }
 
 func (connMulti *ConnectionMulti) getState() uint32 {
@@ -138,28 +262,76 @@ func (connMulti *ConnectionMulti) checker() {
 				}
 			}
 		case <-timer.C:
-			for _, addr := range connMulti.addrs {
-				if connMulti.getState() == connClosed {
-					return
-				}
-				if conn, ok := connMulti.getConnectionFromPool(addr); ok {
-					if !conn.ClosedNow() {
-						continue
-					}
-				}
-				conn, _ := tarantool.Connect(addr, connMulti.connOpts)
-				if conn != nil {
-					connMulti.setConnectionToPool(addr, conn)
-				}
-			}
+			connMulti.check()
 		}
 	}
+}
+
+func (connMulti *ConnectionMulti) check() {
+	connMulti.mutex.RLock()
+	defer connMulti.mutex.RUnlock()
+
+	for _, addr := range connMulti.addrs {
+		if connMulti.getState() == connClosed {
+			return
+		}
+		if conn, ok := connMulti.getConnectionFromPool(addr); ok {
+			if !conn.ClosedNow() {
+				continue
+			}
+		}
+		conn, _ := tarantool.Connect(addr, connMulti.connOpts)
+		if conn != nil {
+			connMulti.setConnectionToPool(addr, conn)
+		}
+	}
+}
+
+func (connMulti *ConnectionMulti) nodesRefresher() {
+	for connMulti.getState() != connClosed {
+		timer := time.NewTimer(connMulti.opts.RefreshNodesTimeout)
+		<-timer.C
+
+		addrs, newPool, err := connMulti.getAddrAndPool()
+		if err != nil {
+			connMulti.refreshNodesErr = err
+			return
+		}
+
+		oldPool := connMulti.setPool(newPool, addrs)
+
+		go connMulti.ClearOldPool(oldPool)
+	}
+}
+
+func (connMulti *ConnectionMulti) getAddrAndPool() (addrs []string, newPool map[string]*tarantool.Connection, err error) {
+	connMulti.mutex.RLock()
+	defer connMulti.mutex.RUnlock()
+
+	conn := connMulti.getCurrentConnectionNoLock()
+
+	addrs, err = getNodes(conn, connMulti.opts.GetNodesFuncName)
+	if addrs == nil {
+		return
+	}
+
+	newPool, somebodyAlive, _ := connMulti.reheat(addrs)
+	if !somebodyAlive {
+		err = ErrNoConnection
+		return
+	}
+
+	return
 }
 
 func (connMulti *ConnectionMulti) getCurrentConnection() *tarantool.Connection {
 	connMulti.mutex.RLock()
 	defer connMulti.mutex.RUnlock()
 
+	return connMulti.getCurrentConnectionNoLock()
+}
+
+func (connMulti *ConnectionMulti) getCurrentConnectionNoLock() *tarantool.Connection {
 	for _, addr := range connMulti.addrs {
 		conn := connMulti.pool[addr]
 		if conn != nil {

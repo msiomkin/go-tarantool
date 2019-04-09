@@ -131,6 +131,8 @@ type Connection struct {
 	state   uint32
 	dec     *msgpack.Decoder
 	lenbuf  [PacketLengthBytes]byte
+
+	busy sync.WaitGroup
 }
 
 var _ = Connector(&Connection{}) // check compatibility with connector interface
@@ -664,6 +666,7 @@ func (conn *Connection) newFuture(requestCode int32) (fut *Future) {
 		}
 	}
 	fut.ready = make(chan struct{})
+	conn.busy.Add(1)
 	fut.requestId = conn.nextRequestId()
 	fut.requestCode = requestCode
 	shardn := fut.requestId & (conn.opts.Concurrency - 1)
@@ -781,6 +784,10 @@ func (conn *Connection) fetchFutureImp(reqid uint32) *Future {
 		}
 		root = &fut.next
 	}
+}
+
+func (conn *Connection) WaitBusy() {
+	conn.busy.Wait()
 }
 
 func (conn *Connection) timeouts() {

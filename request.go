@@ -385,6 +385,7 @@ func (fut *Future) send(conn *Connection, body func(*msgpack.Encoder) error) *Fu
 
 func (fut *Future) markReady(conn *Connection) {
 	close(fut.ready)
+	conn.busy.Done()
 	if conn.rlimit != nil {
 		<-conn.rlimit
 	}
